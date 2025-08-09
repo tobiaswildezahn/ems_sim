@@ -15,12 +15,14 @@ Streamlit-Dashboard für EMS-ABM Hamburg mit OSM-Routing (Echtzeit-Updates)
 - Lädt 'drive'-Netz über OSMnx und cached als GraphML.
 - Berechnet reale Fahrzeiten (edge length + speed_kph -> travel_time).
 - Simuliert Einsätze in Batches und streamt Kennzahlen live ins UI.
+- Start lokal mit `uv run streamlit run abm_dashboard.py`.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 import math, os, time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,16 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     dlmb = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
     return 2 * R * math.asin(math.sqrt(a))
+
+def haversine_km_vec(lat: float, lon: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Vektorisierte Haversine-Distanzberechnung."""
+    R = 6371.0088
+    phi1 = np.radians(lat)
+    phi2 = np.radians(lats)
+    dphi = phi2 - phi1
+    dlmb = np.radians(lons - lon)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlmb / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
 
 @dataclass
 class Hotspot:
@@ -143,31 +155,34 @@ class IncidentStream:
                 min(max(lon, min_lon), max_lon))
 
     def sample_incident_times(self) -> np.ndarray:
-        times = []
-        t = 0.0
-        while t < self.year_minutes and len(times) < self.p.n_incidents:
-            dt = self.rng.exponential(1.0 / self.lambda_per_min)
-            t += dt
-            if t <= self.year_minutes:
-                times.append(t)
-        if len(times) < self.p.n_incidents:
-            extra = self.p.n_incidents - len(times)
-            times += list(self.rng.uniform(0, self.year_minutes, size=extra))
-        return np.sort(np.array(times)[:self.p.n_incidents])
+        n = self.p.n_incidents
+        inter = self.rng.exponential(1.0 / self.lambda_per_min, size=int(n * 1.2))
+        times = np.cumsum(inter)
+        times = times[times <= self.year_minutes]
+        if len(times) < n:
+            extra = self.rng.uniform(0, self.year_minutes, size=n - len(times))
+            times = np.concatenate([times, extra])
+        return np.sort(times)[:n]
 
     def sample_incident_locations(self, n: int) -> np.ndarray:
         hs = self.p.hotspots
         weights = np.array([h.weight for h in hs], dtype=float)
         comp = self.rng.choice(len(hs), size=n, p=weights)
         lats = np.empty(n); lons = np.empty(n)
-        for i, k in enumerate(comp):
-            h = hs[k]
-            dx_km = self.rng.normal(0.0, h.sd_km)
-            dy_km = self.rng.normal(0.0, h.sd_km)
-            deg_lat = dy_km / 111.0
-            deg_lon = dx_km / (111.0 * math.cos(math.radians(h.lat)))
-            lat, lon = self._bounded(h.lat + deg_lat, h.lon + deg_lon)
-            lats[i], lons[i] = lat, lon
+        for idx, h in enumerate(hs):
+            mask = comp == idx
+            cnt = mask.sum()
+            if cnt == 0:
+                continue
+            dx = self.rng.normal(0.0, h.sd_km, size=cnt)
+            dy = self.rng.normal(0.0, h.sd_km, size=cnt)
+            deg_lat = dy / 111.0
+            deg_lon = dx / (111.0 * math.cos(math.radians(h.lat)))
+            lat = h.lat + deg_lat
+            lon = h.lon + deg_lon
+            min_lat, min_lon, max_lat, max_lon = self.p.bbox
+            lats[mask] = np.clip(lat, min_lat, max_lat)
+            lons[mask] = np.clip(lon, min_lon, max_lon)
         return np.column_stack([lats, lons])
 
 # -----------------------
@@ -211,12 +226,14 @@ class EMSModel:
             ))
 
     def _candidate_units(self, lat: float, lon: float, k: int) -> List[Ambulance]:
-        dists = []
-        for u in self.ambulances:
-            d = haversine_km(lat, lon, u.latlon[0], u.latlon[1])
-            dists.append((d, u))
-        dists.sort(key=lambda x: x[0])
-        return [u for _, u in dists[:min(k, len(dists))]]
+        coords = np.array([u.latlon for u in self.ambulances])
+        dists = haversine_km_vec(lat, lon, coords[:,0], coords[:,1])
+        if len(dists) <= k:
+            idx = np.argsort(dists)
+        else:
+            idx = np.argpartition(dists, k)[:k]
+            idx = idx[np.argsort(dists[idx])]
+        return [self.ambulances[i] for i in idx]
 
     def _summary(self, tt: np.ndarray) -> Dict[str, float]:
         return {
@@ -236,54 +253,63 @@ class EMSModel:
         n = len(times)
 
         travel_times_min = np.full(n, np.nan, dtype=float)
+        recent: List[Tuple[float, float]] = []
         t0 = time.time()
 
-        for idx, (t_inc, (lat, lon)) in enumerate(zip(times, locs)):
-            target_node = self.router.nearest_node(lat, lon)
-            candidates = self._candidate_units(lat, lon, self.p.k_candidates)
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            for idx, (t_inc, (lat, lon)) in enumerate(zip(times, locs)):
+                target_node = self.router.nearest_node(lat, lon)
+                candidates = self._candidate_units(lat, lon, self.p.k_candidates)
 
-            best_eta = float('inf'); best_unit = None; best_t_travel_min = None
-            for u in candidates:
-                depart = max(t_inc, u.free_at)
-                tt_sec = self.router.tt_seconds(u.node, target_node)
-                if not math.isfinite(tt_sec):
-                    continue
-                eta = depart + tt_sec/60.0
-                if eta < best_eta:
-                    best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
-
-            if best_unit is None:
-                # Fallback: prüfe alle
-                for u in self.ambulances:
-                    depart = max(t_inc, u.free_at)
-                    tt_sec = self.router.tt_seconds(u.node, target_node)
+                best_eta = float('inf'); best_unit = None; best_t_travel_min = None
+                futures = [pool.submit(self.router.tt_seconds, u.node, target_node) for u in candidates]
+                for u, fut in zip(candidates, futures):
+                    tt_sec = fut.result()
                     if not math.isfinite(tt_sec):
                         continue
+                    depart = max(t_inc, u.free_at)
                     eta = depart + tt_sec/60.0
                     if eta < best_eta:
                         best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
 
-            # Metriken + Status pflegen
-            if best_unit is not None:
-                travel_times_min[idx] = best_t_travel_min
-                arrival = max(t_inc, best_unit.free_at) + best_t_travel_min
-                best_unit.node = target_node
-                best_unit.latlon = (lat, lon)
-                best_unit.free_at = arrival + self.p.service_time_min
+                if best_unit is None:
+                    # Fallback: prüfe alle
+                    futures = [pool.submit(self.router.tt_seconds, u.node, target_node) for u in self.ambulances]
+                    for u, fut in zip(self.ambulances, futures):
+                        tt_sec = fut.result()
+                        if not math.isfinite(tt_sec):
+                            continue
+                        depart = max(t_inc, u.free_at)
+                        eta = depart + tt_sec/60.0
+                        if eta < best_eta:
+                            best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
 
-            # Batch-Update
-            if ((idx + 1) % batch_size == 0) or (idx + 1 == n):
-                valid = np.isfinite(travel_times_min[:idx+1])
-                tt = travel_times_min[:idx+1][valid]
-                elapsed = time.time() - t0
-                ips = (idx + 1) / elapsed if elapsed > 0 else 0.0
-                yield {
-                    "processed": idx + 1,
-                    "total": n,
-                    "elapsed_s": elapsed,
-                    "incidents_per_s": ips,
-                    **self._summary(tt),
-                }
+                # Metriken + Status pflegen
+                if best_unit is not None:
+                    travel_times_min[idx] = best_t_travel_min
+                    arrival = max(t_inc, best_unit.free_at) + best_t_travel_min
+                    best_unit.node = target_node
+                    best_unit.latlon = (lat, lon)
+                    best_unit.free_at = arrival + self.p.service_time_min
+
+                recent.append((lat, lon))
+                if len(recent) > 500:
+                    recent.pop(0)
+
+                # Batch-Update
+                if ((idx + 1) % batch_size == 0) or (idx + 1 == n):
+                    valid = np.isfinite(travel_times_min[:idx+1])
+                    tt = travel_times_min[:idx+1][valid]
+                    elapsed = time.time() - t0
+                    ips = (idx + 1) / elapsed if elapsed > 0 else 0.0
+                    yield {
+                        "processed": idx + 1,
+                        "total": n,
+                        "elapsed_s": elapsed,
+                        "incidents_per_s": ips,
+                        "recent": np.array(recent),
+                        **self._summary(tt),
+                    }
 
 # -----------------------
 # Streamlit UI
@@ -314,6 +340,7 @@ m_p90  = cols[3].empty()
 m_p95  = cols[4].empty()
 m_p99  = cols[5].empty()
 
+map_placeholder = st.empty()
 progress = st.progress(0.0)
 chart_placeholder = st.empty()
 log_placeholder = st.empty()
@@ -350,6 +377,10 @@ if start:
 
         # Fortschritt
         progress.progress(min(pct, 1.0))
+
+        if len(upd["recent"]):
+            df_map = pd.DataFrame(upd["recent"], columns=["lat","lon"])
+            map_placeholder.map(df_map)
 
         # Chart aktualisieren
         chart_df.loc[len(chart_df)] = [processed, upd["p50"], upd["p90"], upd["mean"]]
