@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.venv*/
+.env*
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# macOS
+.DS_Store
+
+# uv
+.uv/
+.uv_cache/
+
+# OSMnx/Geo-Daten
+*.graphml
+*.gpkg
+*.geojson
+*.parquet
+data/
+cache/
+osmnx_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/
