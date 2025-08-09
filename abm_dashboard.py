@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 import math, os, time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -255,57 +256,60 @@ class EMSModel:
         recent: List[Tuple[float, float]] = []
         t0 = time.time()
 
-        for idx, (t_inc, (lat, lon)) in enumerate(zip(times, locs)):
-            target_node = self.router.nearest_node(lat, lon)
-            candidates = self._candidate_units(lat, lon, self.p.k_candidates)
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            for idx, (t_inc, (lat, lon)) in enumerate(zip(times, locs)):
+                target_node = self.router.nearest_node(lat, lon)
+                candidates = self._candidate_units(lat, lon, self.p.k_candidates)
 
-            best_eta = float('inf'); best_unit = None; best_t_travel_min = None
-            for u in candidates:
-                depart = max(t_inc, u.free_at)
-                tt_sec = self.router.tt_seconds(u.node, target_node)
-                if not math.isfinite(tt_sec):
-                    continue
-                eta = depart + tt_sec/60.0
-                if eta < best_eta:
-                    best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
-
-            if best_unit is None:
-                # Fallback: prüfe alle
-                for u in self.ambulances:
-                    depart = max(t_inc, u.free_at)
-                    tt_sec = self.router.tt_seconds(u.node, target_node)
+                best_eta = float('inf'); best_unit = None; best_t_travel_min = None
+                futures = [pool.submit(self.router.tt_seconds, u.node, target_node) for u in candidates]
+                for u, fut in zip(candidates, futures):
+                    tt_sec = fut.result()
                     if not math.isfinite(tt_sec):
                         continue
+                    depart = max(t_inc, u.free_at)
                     eta = depart + tt_sec/60.0
                     if eta < best_eta:
                         best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
 
-            # Metriken + Status pflegen
-            if best_unit is not None:
-                travel_times_min[idx] = best_t_travel_min
-                arrival = max(t_inc, best_unit.free_at) + best_t_travel_min
-                best_unit.node = target_node
-                best_unit.latlon = (lat, lon)
-                best_unit.free_at = arrival + self.p.service_time_min
+                if best_unit is None:
+                    # Fallback: prüfe alle
+                    futures = [pool.submit(self.router.tt_seconds, u.node, target_node) for u in self.ambulances]
+                    for u, fut in zip(self.ambulances, futures):
+                        tt_sec = fut.result()
+                        if not math.isfinite(tt_sec):
+                            continue
+                        depart = max(t_inc, u.free_at)
+                        eta = depart + tt_sec/60.0
+                        if eta < best_eta:
+                            best_eta = eta; best_unit = u; best_t_travel_min = tt_sec/60.0
 
-            recent.append((lat, lon))
-            if len(recent) > 500:
-                recent.pop(0)
+                # Metriken + Status pflegen
+                if best_unit is not None:
+                    travel_times_min[idx] = best_t_travel_min
+                    arrival = max(t_inc, best_unit.free_at) + best_t_travel_min
+                    best_unit.node = target_node
+                    best_unit.latlon = (lat, lon)
+                    best_unit.free_at = arrival + self.p.service_time_min
 
-            # Batch-Update
-            if ((idx + 1) % batch_size == 0) or (idx + 1 == n):
-                valid = np.isfinite(travel_times_min[:idx+1])
-                tt = travel_times_min[:idx+1][valid]
-                elapsed = time.time() - t0
-                ips = (idx + 1) / elapsed if elapsed > 0 else 0.0
-                yield {
-                    "processed": idx + 1,
-                    "total": n,
-                    "elapsed_s": elapsed,
-                    "incidents_per_s": ips,
-                    "recent": np.array(recent),
-                    **self._summary(tt),
-                }
+                recent.append((lat, lon))
+                if len(recent) > 500:
+                    recent.pop(0)
+
+                # Batch-Update
+                if ((idx + 1) % batch_size == 0) or (idx + 1 == n):
+                    valid = np.isfinite(travel_times_min[:idx+1])
+                    tt = travel_times_min[:idx+1][valid]
+                    elapsed = time.time() - t0
+                    ips = (idx + 1) / elapsed if elapsed > 0 else 0.0
+                    yield {
+                        "processed": idx + 1,
+                        "total": n,
+                        "elapsed_s": elapsed,
+                        "incidents_per_s": ips,
+                        "recent": np.array(recent),
+                        **self._summary(tt),
+                    }
 
 # -----------------------
 # Streamlit UI
